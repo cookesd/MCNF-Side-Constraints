@@ -15,6 +15,11 @@ edge_df = pd.DataFrame({'source':[1,1,2,2,3],
                           'weight':[0,0,1,0,1],
                           'capacity':[1]*5,
                           'con_c':[0,0,0,1,0]})
+constraint_df = pd.DataFrame({'constraint':['c1','c1'],
+                              'edge':[(2,4),(3,4)],
+                              'coeff':[1,-1],
+                              'rhs':[0,0],
+                              'sense':['=','=']})
 mult_ind_edge_df = edge_df.set_index(['source','target'])
 node_demands = {1:-2,2:0,3:0,4:2}
 nodes = set(edge_df.source.unique()).union(set(edge_df.target.unique()))
@@ -23,12 +28,14 @@ edges = [(u,v) for u,v in zip(edge_df.source.values,edge_df.target.values)]
 #%% Build Model
 
 class SCModel(object):
-    def __init__(self,edgelist_df,node_demand_dict):
+    def __init__(self,edgelist_df,node_demand_dict,constraint_df = None):
         self.super_source = -1
         self.super_sink = 0
         self.edgelist_df = edgelist_df
         self.multi_ind_edgelist_df = edgelist_df.set_index(['source','target'])
         self.node_demand_dict = node_demand_dict
+        self.constraint_df = constraint_df
+        self.alpha_dict = {con:0 for con in self.constraint_df.constraint.unique()}
         
         # Should probably make 'update' methods for these
         # So that they can be updated when user adds/deletes nodes/edges
@@ -252,13 +259,39 @@ class SCModel(object):
                                           self.aug_node_demand_dict)
         # model.alpha = pyo.Param()
         def obj_rule(model):
-            z = sum([float(self.aug_multi_ind_edgelist_df.loc[(u,v),:'weight']) * model.x_ij[(u,v)]
-                     for u,v in self.aug_edges])
+            z = (sum([float(self.aug_multi_ind_edgelist_df.loc[(u,v),:'weight']) * model.x_ij[(u,v)]
+                     for u,v in self.aug_edges]) +
+                 # get the dual adjusted portion of the objective to satisfy the constraints
+            sum([self.alphas[con] * sum([self.constraint_df.loc[i,'coeff'] * model.x_ij[self.constraint_df.loc[i,'edge']]
+                                         for i in self.constraint_df[self.constraint_df['constraint']==con].index])
+                 for con in self.constraint_df.constraint.unique()]))
             return(z)
         model.obj = pyo.Objective(rule=obj_rule,sense=1)
         self.aug_model = model
     
     
+    def solve_mcnf_side_con(self):
+        '''
+        Solve the MCNF side constraint problem by iteratively updating dual variables
+        associated with the constraints to ensure they're satisfied
+
+        Returns
+        -------
+        None.
+
+        '''
+        # Solve the base model
+        # while there is a constraint that's not satisfied:
+            # Adjust the alpha value for that constraint
+                # This will need to be another function.
+                # I need to make sure that new value will be picked up in the
+                # model when we resolve or if we need to update the obj_rule function
+                # to hold that new value
+            # Resolve the model
+            # Maybe stop at a max number of iterations
+        # The flow should be stored in the augmentation graph
+        # so we can use that to print, plot, etc.
+        pass
     
     def solve(self,model):
         '''
@@ -279,53 +312,54 @@ class SCModel(object):
 
 
 #%% test class
-a = SCModel(edge_df,node_demands)
-a.build_aug_model()
-a.solve(a.aug_model)
-a.aug_model.pprint()
+if __name__ == '__main__':
+    a = SCModel(edge_df,node_demands,constraint_df)
+    a.build_aug_model()
+    a.solve(a.aug_model)
+    a.aug_model.pprint()
+    
+    print('The obj value is {}'.format(pyo.value(a.aug_model.obj)))
+    print('The flow is below:')
+    a.aug_model.x_ij.pprint()
+    
+    flow_s = pd.Series({(u,v):pyo.value(a.aug_model.x_ij[(u,v)]) for u,v in a.aug_edges},name='flow')
+    flow_s.index.names = ['source','target']
+    print(flow_s)
+# #%% Example MCNF Model    
+# model = pyo.ConcreteModel()
+# model.nodes = pyo.Set(nodes)
 
-print('The obj value is {}'.format(pyo.value(a.aug_model.obj)))
-print('The flow is below:')
-a.aug_model.x_ij.pprint()
+# def edge_caps(model,u,v):
+#     # return(0,1)
+#     return((0,mult_ind_edge_df.loc[(u,v),'capacity']))
+# model.x_ij = pyo.Var(edges,bounds=edge_caps)
 
-flow_s = pd.Series({(u,v):pyo.value(a.aug_model.x_ij[(u,v)]) for u,v in a.aug_edges},name='flow')
-flow_s.index.names = ['source','target']
-print(flow_s)
-#%% Example MCNF Model    
-model = pyo.ConcreteModel()
-model.nodes = pyo.Set(nodes)
+# def obj_rule(model):
+#     z = sum([float(mult_ind_edge_df.loc[(u,v),:'weight']) * model.x_ij[(u,v)]
+#              for u,v in edges])
+#     return(z)
+# model.obj = pyo.Objective(rule=obj_rule,sense=1)
 
-def edge_caps(model,u,v):
-    # return(0,1)
-    return((0,mult_ind_edge_df.loc[(u,v),'capacity']))
-model.x_ij = pyo.Var(edges,bounds=edge_caps)
+# def get_node_balance_lhs(model,node):
+#     lhs = (sum([model.x_ij[(u,v)] for u,v in edges if v == node]) -
+#     sum([model.x_ij[(u,v)] for u,v in edges if u == node]))
+#     print(lhs)
+#     return(lhs)
 
-def obj_rule(model):
-    z = sum([float(mult_ind_edge_df.loc[(u,v),:'weight']) * model.x_ij[(u,v)]
-             for u,v in edges])
-    return(z)
-model.obj = pyo.Objective(rule=obj_rule,sense=1)
+# def node_balance_rule(model,node):
+#     return((sum([model.x_ij[(u,v)] for u,v in edges if v == node]) -
+#     sum([model.x_ij[(u,v)] for u,v in edges if u == node])) <= node_demands[node])
+#     # return(get_node_balance_lhs(model,node) <= node_demands[node])
 
-def get_node_balance_lhs(model,node):
-    lhs = (sum([model.x_ij[(u,v)] for u,v in edges if v == node]) -
-    sum([model.x_ij[(u,v)] for u,v in edges if u == node]))
-    print(lhs)
-    return(lhs)
-
-def node_balance_rule(model,node):
-    return((sum([model.x_ij[(u,v)] for u,v in edges if v == node]) -
-    sum([model.x_ij[(u,v)] for u,v in edges if u == node])) <= node_demands[node])
-    # return(get_node_balance_lhs(model,node) <= node_demands[node])
-
-model.node_balance_cons = pyo.Constraint(nodes,rule=node_balance_rule)
+# model.node_balance_cons = pyo.Constraint(nodes,rule=node_balance_rule)
 
 
-#%% Solve model
-solver = pyo.SolverFactory('glpk')
-res = solver.solve(model)
-print('The obj value is {}'.format(pyo.value(model.obj)))
-print('The flow is below:')
-model.x_ij.pprint()
+# #%% Solve model
+# solver = pyo.SolverFactory('glpk')
+# res = solver.solve(model)
+# print('The obj value is {}'.format(pyo.value(model.obj)))
+# print('The flow is below:')
+# model.x_ij.pprint()
 
-flow_s = pd.Series({(u,v):pyo.value(model.x_ij[(u,v)]) for u,v in edges},name='flow')
-print(flow_s)
+# flow_s = pd.Series({(u,v):pyo.value(model.x_ij[(u,v)]) for u,v in edges},name='flow')
+# print(flow_s)
