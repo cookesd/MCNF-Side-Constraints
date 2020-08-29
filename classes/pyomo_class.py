@@ -9,35 +9,23 @@ import pyomo.environ as pyo
 from pyomo.environ import *
 import pandas as pd
 
-#%% Setup input data
-edge_df = pd.DataFrame({'source':[1,1,2,2,3],
-                          'target':[2,3,4,3,4],
-                          'weight':[0,0,1,0,1],
-                          'capacity':[1]*5,
-                          'con_c':[0,0,0,1,0]})
-constraint_df = pd.DataFrame({'constraint':['c1','c1'],
-                              'edge':[(2,4),(3,4)],
-                              'coeff':[1,-1],
-                              'rhs':[0,0],
-                              'sense':['=','=']})
-mult_ind_edge_df = edge_df.set_index(['source','target'])
-node_demands = {1:-2,2:0,3:0,4:2}
-nodes = set(edge_df.source.unique()).union(set(edge_df.target.unique()))
-edges = [(u,v) for u,v in zip(edge_df.source.values,edge_df.target.values)]
 
 #%% Build Model
 
 class SCModel(object):
-    def __init__(self,edgelist_df,node_demand_dict,constraint_df = None):
+    def __init__(self,edgelist_df,node_demand_dict,constraint_df = None,max_iterations=10):
         self.super_source = -1
         self.super_sink = 0
         self.edgelist_df = edgelist_df
         self.multi_ind_edgelist_df = edgelist_df.set_index(['source','target'])
         self.node_demand_dict = node_demand_dict
         self.constraint_df = constraint_df
+        # set dual variables to 0 in first iteration for all constraints
         self.alpha_dict = {con:0 for con in self.constraint_df.constraint.unique()}
+        self.alpha_df = pd.DataFrame(self.alpha_dict,index=[0])
+        self.max_iterations = max_iterations
         
-        # Should probably make 'update' methods for these
+        # Should probably make 'add','update',and 'remove' methods for these
         # So that they can be updated when user adds/deletes nodes/edges
         self.edges = [(u,v) for u,v in zip(edgelist_df.source.values,
                                            edgelist_df.target.values)]
@@ -54,6 +42,7 @@ class SCModel(object):
                                    sum([d for n,d in self.base_demand_nodes_demands.items()])])
         
         # Get augmenting graph data
+            # Make super source and super sink nodes to handle unequal supply/demand
         self.aug_multi_ind_edgelist_df = self.make_aug_edgelist()
         self.aug_node_demand_dict = self.make_aug_node_demand_dict()
         self.aug_edges = list(self.aug_multi_ind_edgelist_df.index)
@@ -244,6 +233,26 @@ class SCModel(object):
         model.obj = pyo.Objective(rule=obj_rule,sense=1)
         self.base_model = model
     
+    def lagrangian_obj_rule(self,model):
+            z = (sum([float(self.aug_multi_ind_edgelist_df.loc[(u,v),:'weight']) * model.x_ij[(u,v)]
+                     for u,v in self.aug_edges]) +
+                 # get the dual adjusted portion of the objective to satisfy the constraints
+                 # $\alpha_k * [(a_{i,j,k} *x_{i,j}) - b_k]$
+            sum([self.alpha_dict[con] * sum([(self.constraint_df.loc[i,'coeff'] *
+                                              model.x_ij[self.constraint_df.loc[i,'edge']]) + 
+                                             self.constraint_df.loc[i,'rhs']
+                                         for i in self.constraint_df[self.constraint_df['constraint']==con].index])
+                 for con in self.constraint_df.constraint.unique()]))
+            return(z)
+    def update_aug_obj(self,model,verbose=False):
+        '''Delete previous objective (if exist) and make new objective with updated values'''
+        for obj in model.component_objects(pyo.Objective):
+            model.del_component(obj)
+        model.obj = pyo.Objective(rule=self.lagrangian_obj_rule,sense=pyo.minimize)
+        if verbose:
+            self.aug_model.obj.pprint()
+        
+        
     def build_aug_model(self):
         '''
         Build pyomo LP model for MCNF on the augmentation graph. Calls _make_model and
@@ -258,16 +267,10 @@ class SCModel(object):
                                           self.aug_multi_ind_edgelist_df,
                                           self.aug_node_demand_dict)
         # model.alpha = pyo.Param()
-        def obj_rule(model):
-            z = (sum([float(self.aug_multi_ind_edgelist_df.loc[(u,v),:'weight']) * model.x_ij[(u,v)]
-                     for u,v in self.aug_edges]) +
-                 # get the dual adjusted portion of the objective to satisfy the constraints
-            sum([self.alphas[con] * sum([self.constraint_df.loc[i,'coeff'] * model.x_ij[self.constraint_df.loc[i,'edge']]
-                                         for i in self.constraint_df[self.constraint_df['constraint']==con].index])
-                 for con in self.constraint_df.constraint.unique()]))
-            return(z)
-        model.obj = pyo.Objective(rule=obj_rule,sense=1)
+        # Save this as the object's model (without an objective)
         self.aug_model = model
+        # Add the objective to the model
+        self.update_aug_obj(self.aug_model)
     
     
     def solve_mcnf_side_con(self):
@@ -280,18 +283,98 @@ class SCModel(object):
         None.
 
         '''
-        # Solve the base model
-        # while there is a constraint that's not satisfied:
-            # Adjust the alpha value for that constraint
-                # This will need to be another function.
-                # I need to make sure that new value will be picked up in the
-                # model when we resolve or if we need to update the obj_rule function
-                # to hold that new value
-            # Resolve the model
-            # Maybe stop at a max number of iterations
-        # The flow should be stored in the augmentation graph
-        # so we can use that to print, plot, etc.
-        pass
+        
+        self.solve(self.aug_model)
+        gradient = self._get_gradient()
+        epsilon = .05
+        iteration = 1
+        max_iterations = self.max_iterations
+        while any([abs(partial) >= epsilon for partial in gradient.values()]):
+            # some constraint is not satisfied so must change the dual variables
+            print('Gradient for iteration {}:'.format(iteration))
+            print(pd.Series(gradient))
+            
+            # determine step size of change
+            gamma = self._get_step_size(gradient_dict=gradient)
+            
+            # set the new alpha values as the previous minus the gradient times the step size
+            new_alphas = {key:val + gamma*gradient[key] for key,val in self.alpha_dict.items()}
+            self.alpha_dict = new_alphas
+            # add this new set of alphas to the dictionary for record
+            self.alpha_df = pd.concat([self.alpha_df,
+                                       pd.DataFrame(new_alphas,index=[0])],
+                                      ignore_index=True)
+            
+            # Delete previous objective function and update with new alpha values
+            self.update_aug_obj(self.aug_model)
+            
+            
+            # Re-solve model with updated objective
+            self.solve(self.aug_model)
+            # Get new gradient values
+            gradient = self._get_gradient()
+            if iteration == max_iterations:
+                print('Max iterations ({}) reached. Current solution saved'.format(max_iterations))
+                break
+            iteration += 1
+        
+            
+    def _get_step_size(self,gradient_dict,verbose=False):
+        min_step_size = .05
+        
+        def step_size_obj_rule(model):
+            z = sum([(self.alpha_dict[con] + model.step_size*gradient_dict[con]) * sum([(self.constraint_df.loc[i,'coeff'] *
+                                              pyo.value(self.aug_model.x_ij[self.constraint_df.loc[i,'edge']])) + 
+                                             self.constraint_df.loc[i,'rhs']
+                                         for i in self.constraint_df[self.constraint_df['constraint']==con].index])
+                 for con in self.constraint_df.constraint.unique()])
+            return(z)
+        step_size_model = pyo.ConcreteModel()
+        step_size_model.step_size = pyo.Var(domain=pyo.NonNegativeReals,initialize=min_step_size)
+        step_size_model.obj = pyo.Objective(rule = step_size_obj_rule,sense=pyo.minimize)
+        # Solve the model
+        step_size_solver = pyo.SolverFactory('glpk')
+        res = step_size_solver.solve(step_size_model)
+        
+        # Determine the step size (set to something small if solution says it should be 0)
+        step_size = max(min_step_size,pyo.value(step_size_model.step_size))
+        if verbose:
+            print('Argmin solution: {}\nValue Used: {}'.format(pyo.value(step_size_model.step_size),
+                                                               step_size))
+        
+        return(step_size)
+    
+    
+    def _get_gradient(self):
+        '''
+        Get the gradient of the objective function w.r.t. the dual variables (alphas)
+        
+        The alphas are multiplied by the side constraints (ax-b) so we just get the
+        value of ax-b for the current iteration and that's the partial derivative
+        with respect to that component of alpha
+
+        Parameters
+        ----------
+        None.
+
+        Returns
+        -------
+        grad_dict : dict
+            The gradient with respect to the alpha associated with each side constraint
+
+        '''
+        
+        grad_dict = {key:0 for key in self.alpha_dict.keys()}
+        for key in self.alpha_dict.keys():
+            c_df = self.constraint_df.loc[self.constraint_df['constraint']==key,:]
+            grad_dict[key] = float(sum([a*x for a,x in zip(c_df['coeff'].values,
+                                                     [pyo.value(self.aug_model.x_ij[edge])
+                                                      for edge in c_df['edge'].values])]) -
+            c_df['rhs'].unique())
+                                                      
+        
+        return(grad_dict)
+        
     
     def solve(self,model):
         '''
@@ -313,18 +396,44 @@ class SCModel(object):
 
 #%% test class
 if __name__ == '__main__':
+    # Setup input data
+    # edge_df = pd.DataFrame({'source':[1,1,2,2,3],
+    #                           'target':[2,3,3,4,4],
+    #                           'weight':[0,0,0,1,1],
+    #                           'capacity':[1]*5,
+    #                           'con_c':[0,0,0,1,0]})
+    edge_df = pd.DataFrame({'source':[1,1,2,2,3],
+                              'target':[2,3,3,4,4],
+                              'weight':[0,0,0,1,0], # costs 1 to go 2-4
+                              'capacity':[1,1,1,1,2], # can send 2 units on edges (3,4) 1 on others
+                              'con_c':[0,0,0,1,0]})
+    # Single constraint saying edges (2,4) and (3,4) must sent same amount of flow (x_{2,4} - x_{3,4} = 0)
+    constraint_df = pd.DataFrame({'constraint':['c1','c1'],
+                                  'edge':[(2,4),(3,4)],
+                                  'coeff':[1,-1],
+                                  'rhs':[0,0],
+                                  'sense':['=','=']})
+    mult_ind_edge_df = edge_df.set_index(['source','target'])
+    # 1 is source node, 4 is sink and all others are transshipment nodes
+    node_demands = {1:-2,2:0,3:0,4:2}
+    nodes = set(edge_df.source.unique()).union(set(edge_df.target.unique()))
+    edges = [(u,v) for u,v in zip(edge_df.source.values,edge_df.target.values)]
+
+    # Build object and model
     a = SCModel(edge_df,node_demands,constraint_df)
     a.build_aug_model()
-    a.solve(a.aug_model)
+    a.solve_mcnf_side_con()
+    # a.solve(a.aug_model)
     a.aug_model.pprint()
     
-    print('The obj value is {}'.format(pyo.value(a.aug_model.obj)))
-    print('The flow is below:')
-    a.aug_model.x_ij.pprint()
+    # # Print results
+    # print('The obj value is {}'.format(pyo.value(a.aug_model.obj)))
+    # print('The flow is below:')
+    # a.aug_model.x_ij.pprint()
     
-    flow_s = pd.Series({(u,v):pyo.value(a.aug_model.x_ij[(u,v)]) for u,v in a.aug_edges},name='flow')
-    flow_s.index.names = ['source','target']
-    print(flow_s)
+    # flow_s = pd.Series({(u,v):pyo.value(a.aug_model.x_ij[(u,v)]) for u,v in a.aug_edges},name='flow')
+    # flow_s.index.names = ['source','target']
+    # print(flow_s)
 # #%% Example MCNF Model    
 # model = pyo.ConcreteModel()
 # model.nodes = pyo.Set(nodes)
